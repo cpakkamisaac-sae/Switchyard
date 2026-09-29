@@ -467,16 +467,38 @@ struct CanonicalInput {
 /// Reject new IDs at capacity rather than forgetting where an earlier response is stored.
 #[derive(Default)]
 struct StateOwners {
-    by_id: HashMap<String, StoredState>,
+    by_id: HashMap<StateKey, StoredState>,
 }
 
 const MAX_STATE_OWNERS: usize = 65_536;
 
+/// Conversation keys use a session when available to avoid accidental cross-session sharing.
+/// Session IDs are caller-provided correlation values, not an authentication boundary.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct StateKey {
+    id: String,
+    session_id: Option<String>,
+}
+
+impl StateKey {
+    fn new(id: &str, session_id: Option<&str>) -> Self {
+        Self {
+            id: id.to_owned(),
+            session_id: session_id.map(str::to_owned),
+        }
+    }
+}
+
 impl StateOwners {
     fn owner(&self, id: &str) -> Option<&StoredState> {
-        self.by_id.get(id)
+        self.owner_for_session(id, None)
     }
 
+    fn owner_for_session(&self, id: &str, session_id: Option<&str>) -> Option<&StoredState> {
+        self.by_id.get(&StateKey::new(id, session_id))
+    }
+
+    #[cfg(test)]
     fn remember(
         &mut self,
         response_id: Option<&str>,
@@ -484,14 +506,32 @@ impl StateOwners {
         model: &ModelId,
         history: Option<Arc<MessageHistory>>,
     ) -> std::result::Result<(), LlmClientError> {
+        self.remember_for_session(response_id, conversation_id, None, model, history)
+    }
+
+    fn remember_for_session(
+        &mut self,
+        response_id: Option<&str>,
+        conversation_id: Option<&str>,
+        conversation_session_id: Option<&str>,
+        model: &ModelId,
+        history: Option<Arc<MessageHistory>>,
+    ) -> std::result::Result<(), LlmClientError> {
         let materialized = history.is_some();
-        let ids = [
-            response_id,
-            conversation_id.filter(|id| Some(*id) != response_id),
-        ];
+        let response_key = response_id.map(|id| StateKey::new(id, None));
+        let conversation_key = conversation_id.map(|id| StateKey::new(id, conversation_session_id));
+        let mut keys = Vec::with_capacity(2);
+        if let Some(key) = response_key.as_ref() {
+            keys.push(key);
+        }
+        if let Some(key) = conversation_key.as_ref()
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
         let mut new_ids = 0;
-        for id in ids.into_iter().flatten() {
-            match self.by_id.get(id) {
+        for key in keys {
+            match self.by_id.get(key) {
                 Some(owner) if owner.model != *model && !materialized => {
                     return Err(LlmClientError::ResponseStateConflict);
                 }
@@ -508,20 +548,18 @@ impl StateOwners {
             model: model.clone(),
             history,
         };
-        if let Some(id) = response_id {
+        if let Some(key) = response_key {
             if materialized {
-                self.by_id.insert(id.to_owned(), state.clone());
+                self.by_id.insert(key, state.clone());
             } else {
-                self.by_id
-                    .entry(id.to_owned())
-                    .or_insert_with(|| state.clone());
+                self.by_id.entry(key).or_insert_with(|| state.clone());
             }
         }
-        if let Some(id) = conversation_id {
+        if let Some(key) = conversation_key {
             if materialized {
-                self.by_id.insert(id.to_owned(), state);
+                self.by_id.insert(key, state);
             } else {
-                self.by_id.entry(id.to_owned()).or_insert(state);
+                self.by_id.entry(key).or_insert(state);
             }
         }
         Ok(())
@@ -664,11 +702,24 @@ impl ClientRouter {
     /// Return the recorded model for the requested response or conversation ID.
     fn stored_state_owner(&self, request: &Request) -> Option<StateOwner> {
         let fields = &request.llm_request.extensions.fields;
-        let (trigger, id) = match fields.get("previous_response_id").and_then(Value::as_str) {
-            Some(id) => ("previous_response_id", id),
-            None => ("conversation", conversation_id(fields)?),
-        };
-        let state = self.inner.state_owners.lock().owner(id)?.clone();
+        let (trigger, id, session_id) =
+            match fields.get("previous_response_id").and_then(Value::as_str) {
+                Some(id) => ("previous_response_id", id, None),
+                None => (
+                    "conversation",
+                    conversation_id(fields)?,
+                    request
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.session_id.as_deref()),
+                ),
+            };
+        let state = self
+            .inner
+            .state_owners
+            .lock()
+            .owner_for_session(id, session_id)?
+            .clone();
         Some(StateOwner {
             model: state.model,
             trigger,
@@ -678,11 +729,20 @@ impl ClientRouter {
 
     fn canonical_input(&self, request: &Request) -> CanonicalInput {
         let fields = &request.llm_request.extensions.fields;
-        let parent = fields
-            .get("previous_response_id")
-            .and_then(Value::as_str)
-            .or_else(|| conversation_id(fields))
-            .and_then(|id| self.inner.state_owners.lock().owner(id)?.history.clone());
+        let owners = self.inner.state_owners.lock();
+        let parent = if let Some(id) = fields.get("previous_response_id").and_then(Value::as_str) {
+            owners.owner(id).and_then(|state| state.history.clone())
+        } else {
+            conversation_id(fields).and_then(|id| {
+                let session_id = request
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.session_id.as_deref());
+                owners
+                    .owner_for_session(id, session_id)
+                    .and_then(|state| state.history.clone())
+            })
+        };
         let parent_len = parent.as_ref().map_or(0, |history| history.len);
         let (parent, messages) = match request.llm_request.messages.get(parent_len..) {
             Some(messages) => (parent, messages.to_vec()),
@@ -702,6 +762,10 @@ impl ClientRouter {
         let fields = &request.llm_request.extensions.fields;
         let store = fields.get("store").and_then(Value::as_bool) != Some(false);
         let conversation = conversation_id(fields).map(str::to_owned);
+        let conversation_session_id = request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.session_id.clone());
         let responses_format = WireFormat::OpenAiResponses.into();
         let responses_request = request
             .llm_request
@@ -718,8 +782,14 @@ impl ClientRouter {
             LlmResponse::Agg(agg) => {
                 if let Some(body) = agg.preservation.responses.get(&responses_format) {
                     if self.inner.track_provider_state {
-                        self.remember_response(body, &model, store, conversation.as_deref())
-                            .map_err(|error| LibsyError::client_call(model.clone(), error))?;
+                        self.remember_response(
+                            body,
+                            &model,
+                            store,
+                            conversation.as_deref(),
+                            conversation_session_id.as_deref(),
+                        )
+                        .map_err(|error| LibsyError::client_call(model.clone(), error))?;
                     }
                 } else if let Some(input) = &canonical_input {
                     self.remember_canonical_response(
@@ -727,6 +797,7 @@ impl ClientRouter {
                         &model,
                         store,
                         conversation.as_deref(),
+                        conversation_session_id.as_deref(),
                         input,
                     )
                     .map_err(|error| LibsyError::client_call(model.clone(), error))?;
@@ -741,6 +812,7 @@ impl ClientRouter {
                         router,
                         model,
                         conversation,
+                        conversation_session_id,
                         canonical_input,
                         ResponseAccumulator::new(),
                         false,
@@ -751,6 +823,7 @@ impl ClientRouter {
                         router,
                         model,
                         conversation,
+                        conversation_session_id,
                         canonical_input,
                         mut accumulator,
                         mut native_responses,
@@ -766,6 +839,7 @@ impl ClientRouter {
                                     &model,
                                     store,
                                     conversation.as_deref(),
+                                    conversation_session_id.as_deref(),
                                     input,
                                 )?;
                             }
@@ -784,6 +858,7 @@ impl ClientRouter {
                                     &model,
                                     store,
                                     conversation.as_deref(),
+                                    conversation_session_id.as_deref(),
                                 )?;
                             }
                         }
@@ -807,6 +882,7 @@ impl ClientRouter {
                                 router,
                                 model,
                                 conversation,
+                                conversation_session_id,
                                 canonical_input,
                                 accumulator,
                                 native_responses,
@@ -828,6 +904,7 @@ impl ClientRouter {
         model: &ModelId,
         store: bool,
         conversation: Option<&str>,
+        conversation_session_id: Option<&str>,
     ) -> std::result::Result<(), LlmClientError> {
         let mut owners = self.inner.state_owners.lock();
         let response_id = body
@@ -835,7 +912,13 @@ impl ClientRouter {
             .and_then(Value::as_str)
             .filter(|_| body.get("store").and_then(Value::as_bool).unwrap_or(store));
         let conversation = body.as_object().and_then(conversation_id).or(conversation);
-        if let Err(error) = owners.remember(response_id, conversation, model, None) {
+        if let Err(error) = owners.remember_for_session(
+            response_id,
+            conversation,
+            conversation_session_id,
+            model,
+            None,
+        ) {
             if matches!(error, LlmClientError::ResponseStateLimitExceeded { .. }) {
                 tracing::warn!(%error, "Responses state owner capacity reached; state was not retained");
             } else {
@@ -852,6 +935,7 @@ impl ClientRouter {
         model: &ModelId,
         store: bool,
         conversation: Option<&str>,
+        conversation_session_id: Option<&str>,
         input: &CanonicalInput,
     ) -> std::result::Result<(), LlmClientError> {
         let response_id = response.id.as_deref().filter(|_| store);
@@ -868,9 +952,10 @@ impl ClientRouter {
             input.parent.clone(),
             Arc::from(segment),
         ));
-        let result = self.inner.state_owners.lock().remember(
+        let result = self.inner.state_owners.lock().remember_for_session(
             response_id,
             conversation,
+            conversation_session_id,
             model,
             Some(history),
         );
@@ -920,8 +1005,8 @@ mod tests {
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
     use switchyard_protocol::{
-        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Message, Role,
-        ToolResult, completion_text, text_request, text_response,
+        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Message, Metadata,
+        Role, ToolResult, completion_text, text_request, text_response,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1711,7 +1796,7 @@ mod tests {
         clients.inner.state_owners.lock().by_id = (0..MAX_STATE_OWNERS)
             .map(|id| {
                 (
-                    format!("existing_{id}"),
+                    StateKey::new(&format!("existing_{id}"), None),
                     StoredState {
                         model: model.clone(),
                         history: None,
@@ -1840,6 +1925,73 @@ mod tests {
         Ok(())
     }
 
+    // A caller-controlled conversation ID must not attach another session's canonical history.
+    #[tokio::test]
+    async fn materialized_conversation_state_is_scoped_to_session() -> Result<()> {
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let clients = ClientRouter::new(HashMap::from([(
+            ModelId::from("strong"),
+            client.clone() as Arc<dyn RoutedLlmClient>,
+        )]));
+        let models = to_category_map(&["strong"]);
+        let make_request = |session: &str, input: &str| -> Result<Request> {
+            Ok(Request {
+                llm_request: switchyard_translation::decode_request(
+                    WireFormat::OpenAiResponses,
+                    &json!({
+                        "model": "route",
+                        "input": input,
+                        "conversation": "conv_shared"
+                    }),
+                )
+                .map_err(|error| LibsyError::external("decoding conversation request", error))?,
+                raw_request: None,
+                metadata: Some(Metadata {
+                    session_id: Some(session.to_string()),
+                    ..Metadata::default()
+                }),
+            })
+        };
+
+        for request in [
+            make_request("session-a", "session-a seed")?,
+            make_request("session-b", "session-b first turn")?,
+            make_request("session-a", "session-a follow-up")?,
+        ] {
+            run(
+                Arc::new(switchyard_libsy::Passthrough),
+                clients.clone(),
+                request,
+                models.clone(),
+                None,
+            )
+            .await?;
+        }
+
+        let requests = client.requests.lock();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].llm_request.messages.len(), 1);
+        assert_eq!(requests[1].llm_request.messages.len(), 1);
+        assert!(matches!(
+            requests[1].llm_request.messages[0].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "session-b first turn"
+        ));
+        assert_eq!(requests[2].llm_request.messages.len(), 3);
+        assert!(matches!(
+            requests[2].llm_request.messages[0].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "session-a seed"
+        ));
+        assert!(matches!(
+            requests[2].llm_request.messages[2].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "session-a follow-up"
+        ));
+        Ok(())
+    }
+
     #[test]
     fn concurrent_state_owners_do_not_exceed_capacity() {
         let model = ModelId::from("model/a");
@@ -1847,7 +1999,7 @@ mod tests {
             by_id: (0..MAX_STATE_OWNERS - 16)
                 .map(|id| {
                     (
-                        format!("existing_{id}"),
+                        StateKey::new(&format!("existing_{id}"), None),
                         StoredState {
                             model: model.clone(),
                             history: None,
